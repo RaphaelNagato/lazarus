@@ -105,6 +105,9 @@ jobs:
       - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.17.1
+          # The wrapper (default true) runs terraform through a Node script that exposes
+          # steps.<id>.outputs.stdout/stderr/exitcode. Only needed to reuse that output in
+          # another step (e.g. posting the plan as a PR comment); we don't, so run the raw binary.
           terraform_wrapper: false
 
       - run: terraform init -input=false
@@ -117,7 +120,7 @@ jobs:
         run: |
           {
             echo '```'
-            terraform show tfplan
+            terraform show -no-color tfplan
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
         working-directory: ${{ env.TF_DIR }}
