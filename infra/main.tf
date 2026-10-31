@@ -65,5 +65,17 @@ resource "azurerm_linux_web_app_slot" "laz-dev-web-app-staging-slot" {
   name           = "laz-dev-web-app-staging-slot"
   app_service_id = azurerm_linux_web_app.laz-dev-web-app.id
 
-  site_config {}
+  site_config {
+    health_check_path                 = "/healthz"
+    health_check_eviction_time_in_min = 2
+    application_stack {
+      dotnet_version = "10.0"
+    }
+  }
+
+  # Non-sticky app settings swap with the slot, so these must match the main app.
+  app_settings = {
+    "APPINSIGHTS_INSTRUMENTATIONKEY"        = azurerm_application_insights.laz-dev-app-insights.instrumentation_key
+    "APPLICATIONINSIGHTS_CONNECTION_STRING" = azurerm_application_insights.laz-dev-app-insights.connection_string
+  }
 }
