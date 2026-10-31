@@ -1,0 +1,298 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Pull requests stop after the plan; only pushes to main continue to approval and deploy.
+concurrency:
+  group: lazarus-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_DIR: infra
+  APP_PROJECT: src/Lazarus.Api/Lazarus.Api.csproj
+  RESOURCE_GROUP: rg-lazarus-dev
+  WEB_APP: laz-dev-web-app
+  STAGING_SLOT: laz-dev-web-app-staging-slot
+  # Build number stamped into the zip and set as BUILD_VERSION on the slot.
+  BUILD_VERSION: 1.0.${{ github.run_number }}
+
+jobs:
+  # 1. Validate
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.1
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+        working-directory: ${{ env.TF_DIR }}
+
+      - name: terraform init (no backend)
+        run: terraform init -backend=false -input=false
+        working-directory: ${{ env.TF_DIR }}
+
+      - name: terraform validate
+        run: terraform validate
+        working-directory: ${{ env.TF_DIR }}
+
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ env.TF_DIR }}
+          framework: terraform
+          soft_fail: true # report findings without failing the run; remove once triaged
+
+  # 2. Build and test
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Test
+        run: dotnet test Lazarus.slnx --configuration Release
+
+      - name: Publish
+        run: >
+          dotnet publish ${{ env.APP_PROJECT }}
+          --configuration Release
+          --output publish
+          -p:Version=${{ env.BUILD_VERSION }}
+
+      - name: Zip
+        run: cd publish && zip -r ../app.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ env.BUILD_VERSION }}
+          path: app.zip
+          if-no-files-found: error
+
+  # 3. Plan infra
+  plan:
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: development
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true" # state backend auth via Entra ID, not storage keys
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.1
+
+      - run: terraform init -input=false
+        working-directory: ${{ env.TF_DIR }}
+
+      - run: terraform plan -input=false -out=tfplan
+        working-directory: ${{ env.TF_DIR }}
+
+      - name: Show plan in summary
+        run: |
+          {
+            echo '```'
+            terraform show tfplan
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        working-directory: ${{ env.TF_DIR }}
+
+      # The plan can contain secrets (e.g. the App Insights key), so keep it short-lived.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_DIR }}/tfplan
+          retention-days: 1
+          if-no-files-found: error
+
+  # 4. Approve: the `approval` environment has required reviewers.
+  approve:
+    if: github.event_name != 'pull_request'
+    needs: [plan, build-test]
+    runs-on: ubuntu-latest
+    environment: approval
+    steps:
+      - run: echo "Approved. Applying the reviewed plan and releasing ${{ env.BUILD_VERSION }}."
+
+  # 5. Apply infra
+  apply:
+    needs: approve
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_DIR }}
+
+      - run: terraform init -input=false
+        working-directory: ${{ env.TF_DIR }}
+
+      - run: terraform apply -input=false tfplan
+        working-directory: ${{ env.TF_DIR }}
+
+  # 6. Deploy to staging
+  deploy-staging:
+    needs: [apply, build-test]
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-${{ env.BUILD_VERSION }}
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # BUILD_VERSION must not be a slot (sticky) setting, so it travels with the code on swap.
+      - name: Set BUILD_VERSION on staging
+        run: >
+          az webapp config appsettings set
+          --resource-group "$RESOURCE_GROUP" --name "$WEB_APP" --slot "$STAGING_SLOT"
+          --settings BUILD_VERSION="$BUILD_VERSION"
+
+      - name: Deploy zip to staging
+        run: >
+          az webapp deploy
+          --resource-group "$RESOURCE_GROUP" --name "$WEB_APP" --slot "$STAGING_SLOT"
+          --src-path app.zip --type zip
+
+  # 7. Smoke test staging
+  smoke-staging:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Smoke test staging
+        run: |
+          host="$(az webapp show -g "$RESOURCE_GROUP" -n "$WEB_APP" --slot "$STAGING_SLOT" --query defaultHostName -o tsv)"
+          scripts/smoke-test.sh "https://$host" "$BUILD_VERSION"
+
+  # 8. Swap staging into production
+  swap:
+    needs: smoke-staging
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      previous_version: ${{ steps.previous.outputs.version }}
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Remember what production runs now so a rollback can be verified (empty on first release).
+      - name: Record current production version
+        id: previous
+        run: |
+          host="$(az webapp show -g "$RESOURCE_GROUP" -n "$WEB_APP" --query defaultHostName -o tsv)"
+          version="$(curl -fsS --max-time 20 "https://$host/version" | jq -r '.version' || true)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Swap staging -> production
+        run: >
+          az webapp deployment slot swap
+          --resource-group "$RESOURCE_GROUP" --name "$WEB_APP"
+          --slot "$STAGING_SLOT" --target-slot production
+
+  # 9. Verify production, roll back automatically on failure
+  verify-production:
+    needs: swap
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Smoke test production
+        id: smoke
+        continue-on-error: true
+        run: |
+          host="$(az webapp show -g "$RESOURCE_GROUP" -n "$WEB_APP" --query defaultHostName -o tsv)"
+          scripts/smoke-test.sh "https://$host" "$BUILD_VERSION"
+
+      # After the swap the previous release sits in staging, so swapping again restores it.
+      - name: Roll back (swap back)
+        if: steps.smoke.outcome == 'failure'
+        run: >
+          az webapp deployment slot swap
+          --resource-group "$RESOURCE_GROUP" --name "$WEB_APP"
+          --slot "$STAGING_SLOT" --target-slot production
+
+      - name: Confirm rollback
+        if: steps.smoke.outcome == 'failure' && needs.swap.outputs.previous_version != ''
+        run: |
+          host="$(az webapp show -g "$RESOURCE_GROUP" -n "$WEB_APP" --query defaultHostName -o tsv)"
+          scripts/smoke-test.sh "https://$host" "${{ needs.swap.outputs.previous_version }}"
+
+      - name: Fail the run
+        if: steps.smoke.outcome == 'failure'
+        run: |
+          echo "::error::Production verification failed for $BUILD_VERSION; rolled back."
+          exit 1

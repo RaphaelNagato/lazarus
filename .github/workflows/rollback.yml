@@ -1,0 +1,58 @@
+name: rollback
+
+# Swaps staging and production back. Builds nothing: the previous release is still
+# sitting in the staging slot after a deploy, so rolling back is just another swap.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: lazarus-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-lazarus-dev
+  WEB_APP: laz-dev-web-app
+  STAGING_SLOT: laz-dev-web-app-staging-slot
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Whatever staging reports now is what production will serve after the swap.
+      - name: Record versions before swap
+        id: before
+        run: |
+          prod="$(az webapp show -g "$RESOURCE_GROUP" -n "$WEB_APP" --query defaultHostName -o tsv)"
+          stag="$(az webapp show -g "$RESOURCE_GROUP" -n "$WEB_APP" --slot "$STAGING_SLOT" --query defaultHostName -o tsv)"
+          prod_version="$(curl -fsS --max-time 20 "https://$prod/version" | jq -r '.version' || true)"
+          stag_version="$(curl -fsS --max-time 20 "https://$stag/version" | jq -r '.version' || true)"
+          echo "production: ${prod_version:-unknown}"
+          echo "staging:    ${stag_version:-unknown}"
+          echo "target=$stag_version" >> "$GITHUB_OUTPUT"
+          [ -n "$stag_version" ] || { echo "::error::Staging slot is not serving a version; nothing safe to roll back to."; exit 1; }
+
+      - name: Swap staging <-> production
+        run: >
+          az webapp deployment slot swap
+          --resource-group "$RESOURCE_GROUP" --name "$WEB_APP"
+          --slot "$STAGING_SLOT" --target-slot production
+
+      - name: Verify production runs the rolled-back version
+        run: |
+          host="$(az webapp show -g "$RESOURCE_GROUP" -n "$WEB_APP" --query defaultHostName -o tsv)"
+          scripts/smoke-test.sh "https://$host" "${{ steps.before.outputs.target }}"
