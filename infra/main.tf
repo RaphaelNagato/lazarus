@@ -35,9 +35,17 @@ resource "azurerm_linux_web_app" "laz-dev-web-app" {
   resource_group_name = data.azurerm_resource_group.rg-lazarus-dev.name
   location            = var.location
   service_plan_id     = azurerm_service_plan.laz-dev-service-plan.id
+  https_only          = true
   tags                = var.tags
 
+  logs {
+    detailed_error_messages = true
+    failed_request_tracing  = true
+  }
+
   site_config {
+    ftps_state                        = "Disabled"
+    http2_enabled                     = true
     health_check_path                 = "/healthz"
     health_check_eviction_time_in_min = 2
     application_stack {
@@ -64,8 +72,16 @@ resource "azurerm_linux_web_app" "laz-dev-web-app" {
 resource "azurerm_linux_web_app_slot" "laz-dev-web-app-staging-slot" {
   name           = "laz-dev-web-app-staging-slot"
   app_service_id = azurerm_linux_web_app.laz-dev-web-app.id
+  https_only     = true
+
+  logs {
+    detailed_error_messages = true
+    failed_request_tracing  = true
+  }
 
   site_config {
+    ftps_state                        = "Disabled"
+    http2_enabled                     = true
     health_check_path                 = "/healthz"
     health_check_eviction_time_in_min = 2
     application_stack {
