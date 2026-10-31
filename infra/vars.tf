@@ -24,3 +24,12 @@ variable "sku_name" {
   type        = string
   default     = "S1"
 }
+
+locals {
+  web_app_log_categories = [
+    "AppServiceHTTPLogs",
+    "AppServiceConsoleLogs",
+    "AppServiceAppLogs",
+    "AppServicePlatformLogs",
+  ]
+}

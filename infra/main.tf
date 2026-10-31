@@ -41,6 +41,13 @@ resource "azurerm_linux_web_app" "laz-dev-web-app" {
   logs {
     detailed_error_messages = true
     failed_request_tracing  = true
+
+    http_logs {
+      file_system {
+        retention_in_days = 2
+        retention_in_mb   = 35
+      }
+    }
   }
 
   site_config {
@@ -70,13 +77,20 @@ resource "azurerm_linux_web_app" "laz-dev-web-app" {
 }
 
 resource "azurerm_linux_web_app_slot" "laz-dev-web-app-staging-slot" {
-  name           = "laz-dev-web-app-staging-slot"
+  name           = "${var.prefix}-dev-web-app-staging-slot"
   app_service_id = azurerm_linux_web_app.laz-dev-web-app.id
   https_only     = true
 
   logs {
     detailed_error_messages = true
     failed_request_tracing  = true
+
+    http_logs {
+      file_system {
+        retention_in_days = 2
+        retention_in_mb   = 35
+      }
+    }
   }
 
   site_config {
@@ -93,5 +107,31 @@ resource "azurerm_linux_web_app_slot" "laz-dev-web-app-staging-slot" {
   app_settings = {
     "APPINSIGHTS_INSTRUMENTATIONKEY"        = azurerm_application_insights.laz-dev-app-insights.instrumentation_key
     "APPLICATIONINSIGHTS_CONNECTION_STRING" = azurerm_application_insights.laz-dev-app-insights.connection_string
+  }
+}
+
+resource "azurerm_monitor_diagnostic_setting" "laz-dev-web-app-diag" {
+  name                       = "${var.prefix}-dev-web-app-diag"
+  target_resource_id         = azurerm_linux_web_app.laz-dev-web-app.id
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.laz-dev-law.id
+
+  dynamic "enabled_log" {
+    for_each = local.web_app_log_categories
+    content {
+      category = enabled_log.value
+    }
+  }
+}
+
+resource "azurerm_monitor_diagnostic_setting" "laz-dev-web-app-staging-slot-diag" {
+  name                       = "${var.prefix}-dev-web-app-staging-slot-diag"
+  target_resource_id         = azurerm_linux_web_app_slot.laz-dev-web-app-staging-slot.id
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.laz-dev-law.id
+
+  dynamic "enabled_log" {
+    for_each = local.web_app_log_categories
+    content {
+      category = enabled_log.value
+    }
   }
 }
